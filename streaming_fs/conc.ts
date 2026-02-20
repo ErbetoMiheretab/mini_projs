@@ -1,10 +1,22 @@
-import express from "express";
+import express, { type Request } from "express";
 import fs from "fs";
 import path from "path";
 import { fileURLToPath } from "url";
 
+import {
+  activeUploads,
+  generateReqId,
+  createFilePath,
+  initialUploadStats,
+  updateUploadStats,
+  finalizeUpload,
+  cleanupUpload,
+  updateConsole,
+} from "./utils.ts";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
+
 const app = express();
 const port = 7055;
 
@@ -14,113 +26,66 @@ fs.mkdirSync(uploadDir, { recursive: true });
 fs.mkdirSync(logDir, { recursive: true });
 const logFile = path.join(logDir, "upload.log");
 
-// Global tracker for active uploads
-const activeUploads: Record<string, any> = {};
-
-let lastLineCount = 0;
-function formatMemoryUsage(memoryUsage: NodeJS.MemoryUsage): string {
-  const toMB = (bytes: number) => (bytes / 1024 / 1024).toFixed(2) + " MB";
-  return `
-Memory usage:
-  rss          : ${toMB(memoryUsage.rss)}   (Resident Set Size - total RAM used)
-  heapTotal    : ${toMB(memoryUsage.heapTotal)}   (JS heap allocated)
-  heapUsed     : ${toMB(memoryUsage.heapUsed)}   (JS heap actually used)
-  external     : ${toMB(memoryUsage.external)}   (C++ objects, Buffers, etc.)
-  arrayBuffers : ${toMB(memoryUsage.arrayBuffers)}   (ArrayBuffer allocations)
-`;
-}
-
-function updateConsole() {
-  // Move cursor up by the number of lines we printed last time
-  if (lastLineCount > 0) {
-    process.stdout.write(`\x1b[${lastLineCount}A`);
-  }
-
-  const lines: string[] = [];
-  lines.push("=== 🚀 Active Server Uploads ===");
-
-  const ids = Object.keys(activeUploads);
-  if (ids.length === 0) {
-    lines.push("Status: Idle (No active streams...)   ");
-  } else {
-    ids.forEach((id) => {
-      const up = activeUploads[id];
-      const progress = up.expectedSize
-        ? ((up.received / up.expectedSize) * 100).toFixed(2)
-        : "Unknown";
-      const mbRecv = (up.received / 1024 / 1024).toFixed(2);
-      // Spaces at the end handle clearing leftover characters from shorter lines
-      lines.push(
-        `[${id}] Chunks: ${up.chunks.toString().padEnd(5)} | Recv: ${mbRecv.padEnd(7)}MB | Progress: ${progress}%    `,
-      );
-    });
-  }
-  lines.push("================================");
-
-  // Join lines and print
-  process.stdout.write(lines.join("\n") + "\n");
-  lastLineCount = lines.length;
-}
 app.post("/upload", (req, res) => {
   const startTime = Date.now();
-  const requestId = Math.random().toString(36).substring(7);
-
-  // Capture the chunk size sent by our specific client
-  const clientChunkHeader = req.headers["x-chunk-size"];
-  const clientChunkSizeStr = clientChunkHeader
-    ? `${Number(clientChunkHeader) / 1024}KB`
-    : "Unknown";
-
-  const expectedSize = Number(req.headers["content-length"]);
-  const fileName = `upload-${Date.now()}-${requestId}.mp4`;
-  const filePath = path.join(uploadDir, fileName);
+  const requestId = generateReqId();
+  const filePath = createFilePath(requestId, uploadDir);
 
   // Initialize tracking for this request
-  activeUploads[requestId] = {
-    chunks: 0,
-    received: 0,
-    expectedSize: expectedSize || 0,
-    clientChunkSize: clientChunkSizeStr,
-  };
+  activeUploads[requestId] = initialUploadStats(req, startTime);
 
   const writeStream = fs.createWriteStream(filePath, {
-    // highWaterMark: 1024 * 1024,
+    highWaterMark: 1024 * 1024,
   });
 
+  let lastConsoleUpdate = 0;
+
+  // Stream data with progress tracking
   req.on("data", (chunk) => {
-    activeUploads[requestId].received += chunk.length;
-    activeUploads[requestId].chunks++;
-    updateConsole(); // Update the server terminal live
+    updateUploadStats(requestId, chunk.length);
+    // Only update console every 300ms
+    const now = Date.now();
+    if (now - lastConsoleUpdate > 2000) {
+      updateConsole(activeUploads);
+      lastConsoleUpdate = now;
+    }
+  });
+
+  // Keep the drain listener for writeStream progress (optional, good for large buffers)
+  let lastDrainUpdate = Date.now();
+  writeStream.on("drain", () => {
+    const stats = activeUploads[requestId];
+    // We can update console here too if we want, but the data throttler handles it mostly
+    if (stats && Date.now() - lastDrainUpdate > 2000) {
+      updateConsole(activeUploads);
+      lastDrainUpdate = Date.now();
+    }
   });
 
   req.pipe(writeStream);
 
+
+
   writeStream.on("finish", () => {
-    const stats = activeUploads[requestId];
-    const duration = (Date.now() - startTime) / 1000;
-    const memoryUsage = process.memoryUsage();
-
-    const logEntry = `
-[${new Date().toISOString()}] ${stats.clientChunkSize} //Chunk Setting
-Upload complete
-File: ${filePath}
-Total size: ${(stats.received / 1024 / 1024).toFixed(2)} MB
-Chunks: ${stats.chunks}
-Duration: ${duration} seconds
-${formatMemoryUsage(memoryUsage)}
-----------------------------------------
-`;
-    fs.appendFileSync(logFile, logEntry);
-
-    delete activeUploads[requestId]; // Remove from dashboard
-    updateConsole();
+    finalizeUpload(requestId, filePath, startTime, logFile);
 
     res.send(`Upload ${requestId} done.`);
   });
 
-  req.on("error", () => {
-    delete activeUploads[requestId];
-    updateConsole();
+  req.on("error", (err: Error) => {
+    console.error(`[${requestId}] Request error:`, err);
+    cleanupUpload(requestId);
+    if (!res.headersSent) {
+      res.status(500).send("Upload failed");
+    }
+  });
+
+  writeStream.on("error", (err: Error) => {
+    console.error(`[${requestId}] Write error:`, err);
+    cleanupUpload(requestId);
+    if (!res.headersSent) {
+      res.status(500).send("File save failed");
+    }
   });
 });
 
@@ -128,10 +93,6 @@ app.listen(port, () => {
   console.log(`Server listening on port ${port}`);
 });
 
-
-
 // - For desktop/server environments with plenty of RAM → go with 512 KB for speed.
 // - For memory-constrained systems (IoT, mobile) → go with 2–4 MB to keep allocations low.
 // - Avoid very small chunks (<256 KB) unless you need fine-grained control or error recovery.
-
-
